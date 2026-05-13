@@ -88,7 +88,7 @@ def get_model_and_tokenizer(model_config, llm_device_map="cuda", rank=0):
         with init_empty_weights() and warnings.catch_warnings():
             warnings.simplefilter("ignore")
             model = AutoModelForCausalLM.from_pretrained(model_config.path
-                                                        , torch_dtype="auto"
+                                                        , dtype="auto"
                                                         , trust_remote_code=True
                                                         , attn_implementation=attn_impl)
         model = patch_hf(model, model_config.type, **model_config)
@@ -98,7 +98,7 @@ def get_model_and_tokenizer(model_config, llm_device_map="cuda", rank=0):
         print(f'Worker {rank}: spreading model on {torch.cuda.device_count()} GPUs with device map: ', model.hf_device_map)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_config.path
-                                                     , torch_dtype="auto"
+                                                     , dtype="auto"
                                                      , trust_remote_code=True
                                                      , device_map=llm_device_map
                                                      , attn_implementation=attn_impl)
