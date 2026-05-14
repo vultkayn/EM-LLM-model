@@ -3,6 +3,9 @@ from torch.nn import CrossEntropyLoss
 
 from ..attention import RotaryEmbeddingESM, ATTN_FORWARD, CAUSAL_LM_FORWARD
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+    
+# This approach lacks scalability and will be refactored.
+from transformers import LlamaForCausalLM, MistralForCausalLM, Qwen2ForCausalLM, Phi3ForCausalLM
 
 from typing import List, Optional, Tuple, Union
 import math
@@ -26,25 +29,80 @@ def huggingface_forward(forward):
             v_proj = None
         else:
             raise NotImplementedError(f"The attention module {self.__class__.__name__} does not appear to have the required projection methods.")
+
+        # In transformers >=4.51, num_heads / num_key_value_heads were removed from
+        # the attention module and live on `self.config` instead. Earlier versions
+        # still expose the attributes directly; fall back gracefully.
+        cfg = getattr(self, "config", None)
+        num_heads = getattr(self, "num_heads", None)
+        if num_heads is None and cfg is not None:
+            num_heads = cfg.num_attention_heads
+        num_kv = getattr(self, "num_key_value_heads", None)
+        if num_kv is None and cfg is not None:
+            num_kv = cfg.num_key_value_heads
+        head_dim = getattr(self, "head_dim", None)
+        if head_dim is None and cfg is not None:
+            head_dim = getattr(cfg, "head_dim", cfg.hidden_size // num_heads)
+
         hidden_states, loss, pkv = forward(
-            self, 
-            hidden_states, 
+            self,
             hidden_states,
-            position_ids, 
-            use_cache, 
+            hidden_states,
+            position_ids,
+            use_cache,
             past_key_value,
-            q_proj, 
-            k_proj, 
-            v_proj, 
-            self.o_proj, 
-            self.head_dim, 
-            self.num_heads, 
-            self.num_key_value_heads,
+            q_proj,
+            k_proj,
+            v_proj,
+            self.o_proj,
+            head_dim,
+            num_heads,
+            num_kv,
         )
 
         return hidden_states, loss, pkv
 
     return hf_forward
+
+
+def em_llm_decoder_layer_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask = None,
+    position_ids = None,
+    past_key_value = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    **kwargs,
+):
+    # Mirrors the pre-4.43 LlamaDecoderLayer.forward contract that em-llm's
+    # patched model_forward relies on: returns a tuple whose last element is
+    # the cache (when use_cache=True), with attn_weights inserted in the
+    # middle when output_attentions=True. Required because HF 4.43+ removed
+    # the cache from the decoder-layer return tuple (Cache is mutated in
+    # place) and em-llm's `model_forward` still indexes `layer_outputs[2]`.
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+
+    hidden_states, self_attn_weights, present_kv = self.self_attn(
+        hidden_states=hidden_states,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        use_cache=use_cache,
+    )
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+
+    outputs = (hidden_states,)
+    if output_attentions:
+        outputs += (self_attn_weights,)
+    if use_cache:
+        outputs += (present_kv,)
+    return outputs
 
 def model_forward(
     self,
@@ -227,9 +285,6 @@ def patch_hf(
     **kwargs
 ):
     attn_kwargs.update(kwargs)
-        
-    # This approach lacks scalability and will be refactored.
-    from transformers import LlamaForCausalLM, MistralForCausalLM, Qwen2ForCausalLM, Phi3ForCausalLM
 
     forward = huggingface_forward(ATTN_FORWARD[attn_type](model=model, **attn_kwargs))
 
@@ -242,20 +297,19 @@ def patch_hf(
     else:
         raise ValueError(f"Only supports llama, mistral, phi3, and qwen2 models. {model.__class__.__name__} was passed.")
 
-    hf_rope = model.model.layers[0].self_attn.rotary_emb 
-    if not hasattr(hf_rope, 'dim'):
-        hf_rope.dim = hf_rope.rope_kwargs.get("dim", None)
-        hf_rope.base = hf_rope.rope_kwargs.get("base", None).rope_theta
-        if hf_rope.dim is None and hf_rope.config is not None:
-            hf_rope.base = hf_rope.config.rope_theta
-            partial_rotary_factor = hf_rope.config.partial_rotary_factor if hasattr(hf_rope.config, "partial_rotary_factor") else 1.0
-            head_dim = getattr(hf_rope.config, "head_dim", hf_rope.config.hidden_size // hf_rope.config.num_attention_heads)
-            hf_rope.dim = int(head_dim * partial_rotary_factor)
-        else: 
-            raise NotImplementedError 
-    base = base if base is not None else hf_rope.base
-    distance_scale = distance_scale if distance_scale is not None else 1.0
-    if hasattr(hf_rope, 'short_factor'):
+    # HF 4.43+ moved LlamaRotaryEmbedding off the attention layer onto the
+    # model. Fall back to the attention layer for older HF or Phi-3.
+    hf_rope = getattr(model.model, "rotary_emb", None)
+    if hf_rope is None:
+        hf_rope = model.model.layers[0].self_attn.rotary_emb
+
+    cfg = model.config
+    # Phi-3 short/long-factor scaling path: only available on the per-layer
+    # rotary_emb instance (which still has these attrs on Phi-3).
+    if hasattr(hf_rope, "short_factor"):
+        rope_base = cfg.rope_theta
+        head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
+        rope_dim = int(head_dim * getattr(cfg, "partial_rotary_factor", 1.0))
         new_max_pos_emb = attn_kwargs["n_local"] + attn_kwargs["exc_block_size"]
         scale = new_max_pos_emb / hf_rope.original_max_position_embeddings
         if scale <= 1.0:
@@ -265,19 +319,32 @@ def patch_hf(
             ext_factors = torch.tensor(hf_rope.long_factor)
             distance_scale = math.sqrt(1 + math.log(scale) / math.log(hf_rope.original_max_position_embeddings))
     else:
+        # Standard Llama / Mistral / Qwen2 path: derive directly from config to
+        # be robust across HF versions (rope internals were refactored in 4.43+).
+        rope_base = cfg.rope_theta
+        head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
+        rope_dim = int(head_dim * getattr(cfg, "partial_rotary_factor", 1.0))
         ext_factors = torch.tensor(1.0)
+
+    base = base if base is not None else rope_base
+    distance_scale = distance_scale if distance_scale is not None else 1.0
     rope = RotaryEmbeddingESM(
-        hf_rope.dim,
+        rope_dim,
         base,
         distance_scale,
-        ext_factors
+        ext_factors,
     )
     model.model.position_bias = rope
+
+    DecoderLayer = model.model.layers[0].__class__
 
     def set_forward(m):
         if isinstance(m, Attention):
             m._old_forward = m.forward
             m.forward = forward.__get__(m, Attention)
+        elif isinstance(m, DecoderLayer):
+            m._old_forward = m.forward
+            m.forward = em_llm_decoder_layer_forward.__get__(m, DecoderLayer)
 
     model.apply(set_forward)
 
