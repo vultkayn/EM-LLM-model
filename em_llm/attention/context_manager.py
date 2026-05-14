@@ -322,7 +322,7 @@ class ContextManager:
         self.allow_disk_offload = False if allow_disk_offload is False else None
         self.vector_offload = vector_offload
         if self.allow_disk_offload is None:
-            self.min_free_cpu_memory = kwargs.get("min_free_cpu_memory", 100)  # minimum memory in GB to keep free on CPU during memory block allocation
+            self.min_free_cpu_memory = kwargs.get("min_free_cpu_memory", 40)  # minimum memory in GB to keep free on CPU during memory block allocation
             world_size = 4 if torch.cuda.device_count() == 1 else 2
             self.world_size = kwargs.get("world_size", world_size)
 
