@@ -145,8 +145,9 @@ class GreedySearch:
 
                     time_taken = round(time.time() - start_time, 2)
                     avg_time += time_taken
-                    log = f"Chunk: {int(st / chunk_size + 1)}/{(input_ids.size(1))//chunk_size}, ppl: {ppl}, time: {time_taken}s"
-                    print(log)
+                    if ppl is not None:
+                        log = f"Chunk: {int(st / chunk_size + 1)}/{(input_ids.size(1))//chunk_size}, ppl: {ppl}, time: {time_taken}s"
+                        print(log)
                     if int(st / chunk_size + 1) % 100 == 0:
                         print(torch.cuda.memory_summary())
                         print(f"Average time taken per chunk: {round(avg_time/int(st / chunk_size + 1), 2)}s")
